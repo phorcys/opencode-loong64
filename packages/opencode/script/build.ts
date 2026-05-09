@@ -82,13 +82,17 @@ const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle(
 
 const allTargets: {
   os: string
-  arch: "arm64" | "x64"
+  arch: "arm64" | "x64" | "loong64"
   abi?: "musl"
   avx2?: false
 }[] = [
   {
     os: "linux",
     arch: "arm64",
+  },
+  {
+    os: "linux",
+    arch: "loong64",
   },
   {
     os: "linux",
