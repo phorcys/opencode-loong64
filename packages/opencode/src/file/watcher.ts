@@ -32,9 +32,15 @@ export const Event = {
 
 const watcher = lazy((): typeof import("@parcel/watcher") | undefined => {
   try {
-    const binding = require(
-      `@parcel/watcher-${process.platform}-${process.arch}${process.platform === "linux" ? `-${OPENCODE_LIBC || "glibc"}` : ""}`,
-    )
+    // There is no published @parcel/watcher-linux-loong64-glibc package.
+    // On LoongArch64, @parcel/watcher is built from source and falls back to
+    // ./build/Release/watcher.node, which Bun compile can embed from a static require.
+    if (process.platform === "linux" && process.arch === "loong64" && (OPENCODE_LIBC || "glibc") === "glibc") {
+      return require("@parcel/watcher") as typeof import("@parcel/watcher")
+    }
+
+    const binding =
+      require(`@parcel/watcher-${process.platform}-${process.arch}${process.platform === "linux" ? `-${OPENCODE_LIBC || "glibc"}` : ""}`)
     return createWrapper(binding) as typeof import("@parcel/watcher")
   } catch (error) {
     log.error("failed to load watcher binding", { error })

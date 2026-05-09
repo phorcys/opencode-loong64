@@ -82,13 +82,17 @@ const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle(
 
 const allTargets: {
   os: string
-  arch: "arm64" | "x64"
+  arch: "arm64" | "x64" | "loong64"
   abi?: "musl"
   avx2?: false
 }[] = [
   {
     os: "linux",
     arch: "arm64",
+  },
+  {
+    os: "linux",
+    arch: "loong64",
   },
   {
     os: "linux",
@@ -218,8 +222,8 @@ for (const item of targets) {
     define: {
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_MIGRATIONS: JSON.stringify(migrations),
-      OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + workerRelativePath,
-      OPENCODE_WORKER_PATH: workerPath,
+      OTUI_TREE_SITTER_WORKER_PATH: JSON.stringify(bunfsRoot + workerRelativePath),
+      OPENCODE_WORKER_PATH: JSON.stringify(workerPath),
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
     },
