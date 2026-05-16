@@ -154,6 +154,32 @@ const resolveOpenTUILoong64Library = async () => {
 const createOpenTUILoong64NativePlugin = (sidecar: string): BunPlugin => ({
   name: "opencode-opentui-loong64-native-sidecar",
   setup(build) {
+    build.onLoad({ filter: /@opentui\/core\/index-[^/]+\.js$/ }, async (args) => {
+      const contents = await Bun.file(args.path).text()
+      const importNeedle = 'await import(`@opentui/core-${process.platform}-${process.arch}/index.ts`)'
+      if (!contents.includes(importNeedle)) return
+
+      return {
+        loader: "js",
+        contents:
+          'import { dirname as __opencodeOpenTUIDirname, join as __opencodeOpenTUIJoin } from "path"\n' +
+          contents.replace(
+            [
+              "var module = await import(`@opentui/core-${process.platform}-${process.arch}/index.ts`);",
+              "var targetLibPath = module.default;",
+              "if (isBunfsPath(targetLibPath)) {",
+              '  targetLibPath = targetLibPath.replace("../", "");',
+              "}",
+            ].join("\n"),
+            [
+              "var targetLibPath = __opencodeOpenTUIJoin(",
+              "  __opencodeOpenTUIDirname(process.execPath),",
+              `  ${JSON.stringify(sidecar)},`,
+              ");",
+            ].join("\n"),
+          ),
+      }
+    })
     build.onResolve({ filter: /^@opentui\/core-linux-loong64(?:\/.*)?$/ }, () => ({
       path: "@opentui/core-linux-loong64",
       namespace: "opencode-opentui-native-sidecar",
