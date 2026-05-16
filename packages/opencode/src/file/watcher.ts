@@ -3,6 +3,7 @@ import { Cause, Effect, Layer, Context, Schema } from "effect"
 import { createWrapper } from "@parcel/watcher/wrapper"
 import type ParcelWatcher from "@parcel/watcher"
 import { readdir } from "fs/promises"
+import { createRequire } from "module"
 import path from "path"
 import z from "zod"
 import { Bus } from "@/bus"
@@ -20,6 +21,8 @@ declare const OPENCODE_LIBC: string | undefined
 
 const log = Log.create({ service: "file.watcher" })
 const SUBSCRIBE_TIMEOUT_MS = 10_000
+const PARCEL_WATCHER_LOONG64_SIDECAR = "parcel-watcher.node"
+const requireNative = createRequire(import.meta.url)
 
 export const Event = {
   Updated: BusEvent.define(
@@ -33,15 +36,27 @@ export const Event = {
 
 const watcher = lazy((): typeof import("@parcel/watcher") | undefined => {
   try {
-    const binding = require(
-      `@parcel/watcher-${process.platform}-${process.arch}${process.platform === "linux" ? `-${OPENCODE_LIBC || "glibc"}` : ""}`,
-    )
+    const binding = loadBinding()
     return createWrapper(binding) as typeof import("@parcel/watcher")
   } catch (error) {
     log.error("failed to load watcher binding", { error })
     return
   }
 })
+
+function loadBinding() {
+  if (process.platform === "linux" && process.arch === "loong64" && (OPENCODE_LIBC || "glibc") === "glibc") {
+    try {
+      return requireNative(path.join(path.dirname(process.execPath), PARCEL_WATCHER_LOONG64_SIDECAR))
+    } catch (error) {
+      log.error("failed to load bundled loong64 watcher binding", { error })
+    }
+  }
+
+  return requireNative(
+    `@parcel/watcher-${process.platform}-${process.arch}${process.platform === "linux" ? `-${OPENCODE_LIBC || "glibc"}` : ""}`,
+  )
+}
 
 function getBackend() {
   if (process.platform === "win32") return "windows"
