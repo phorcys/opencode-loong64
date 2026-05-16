@@ -51,6 +51,7 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 
 const opentuiLoong64Sidecar = "libopentui.so"
+const parcelWatcherLoong64Sidecar = "parcel-watcher.node"
 
 type RootPackageJson = {
   workspaces?: {
@@ -166,6 +167,50 @@ const createOpenTUILoong64NativePlugin = (sidecar: string): BunPlugin => ({
     }))
   },
 })
+
+const parcelWatcherLoong64BindingCandidates = () =>
+  [
+    process.env.PARCEL_WATCHER_LOONG64_NODE,
+    path.resolve(dir, "node_modules/@parcel/watcher/build/Release/watcher.node"),
+    path.resolve(dir, "../../node_modules/@parcel/watcher/build/Release/watcher.node"),
+  ]
+    .filter(Boolean)
+    .filter((candidate): candidate is string => fs.existsSync(candidate))
+
+const parcelWatcherSourceCandidates = () =>
+  [
+    path.resolve(dir, "node_modules/@parcel/watcher"),
+    path.resolve(dir, "../../node_modules/@parcel/watcher"),
+  ].filter((candidate) => fs.existsSync(path.join(candidate, "binding.gyp")))
+
+const findParcelWatcherLoong64Binding = () => {
+  for (const candidate of parcelWatcherLoong64BindingCandidates()) {
+    return fs.realpathSync(candidate)
+  }
+}
+
+const buildParcelWatcherLoong64Binding = async () => {
+  for (const sourceRoot of parcelWatcherSourceCandidates()) {
+    console.log(`Building @parcel/watcher linux-loong64-glibc binding from ${sourceRoot}`)
+    await $`bun run build`.cwd(sourceRoot)
+
+    const binding = findParcelWatcherLoong64Binding()
+    if (binding) return binding
+  }
+}
+
+const resolveParcelWatcherLoong64Binding = async () => {
+  const binding = findParcelWatcherLoong64Binding() ?? (await buildParcelWatcherLoong64Binding())
+  if (!binding) {
+    throw new Error(
+      [
+        "Unable to find @parcel/watcher linux-loong64-glibc watcher.node.",
+        "Set PARCEL_WATCHER_LOONG64_NODE or install/build @parcel/watcher on loong64 before packaging.",
+      ].join(" "),
+    )
+  }
+  return binding
+}
 
 const allTargets: {
   os: string
@@ -283,6 +328,10 @@ for (const item of targets) {
   const workerPath = "./src/cli/tui/worker.ts"
   const opentuiLoong64Library =
     item.os === "linux" && item.arch === "loong64" ? await resolveOpenTUILoong64Library() : undefined
+  const parcelWatcherLoong64Binding =
+    item.os === "linux" && item.arch === "loong64" && (item.abi ?? "glibc") === "glibc"
+      ? await resolveParcelWatcherLoong64Binding()
+      : undefined
 
   // Use platform-specific bunfs root path based on target OS
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
@@ -328,6 +377,13 @@ for (const item of targets) {
 
   if (opentuiLoong64Library) {
     await fs.promises.copyFile(opentuiLoong64Library, path.join(dir, "dist", name, "bin", opentuiLoong64Sidecar))
+  }
+
+  if (parcelWatcherLoong64Binding) {
+    await fs.promises.copyFile(
+      parcelWatcherLoong64Binding,
+      path.join(dir, "dist", name, "bin", parcelWatcherLoong64Sidecar),
+    )
   }
 
   // Smoke test: only run if binary is for current platform
