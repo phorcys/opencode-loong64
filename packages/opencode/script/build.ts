@@ -212,6 +212,60 @@ const resolveParcelWatcherLoong64Binding = async () => {
   return binding
 }
 
+const releaseAssetRepo = () => process.env.GH_REPO ?? "anomalyco/opencode"
+
+const npmTarballName = (name: string, version: string) => `${name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`
+
+const releaseAssetUrl = (name: string, version: string) =>
+  `https://github.com/${releaseAssetRepo()}/releases/download/v${version}/${npmTarballName(name, version)}`
+
+const packNpmPackage = async (packageDir: string) => {
+  if (process.platform !== "win32") await $`chmod -R 755 .`.cwd(packageDir)
+  await $`npm pack --pack-destination ${path.join(dir, "dist")} .`.cwd(packageDir)
+}
+
+const releaseAssets = async () =>
+  (
+    await Promise.all(
+      ["*.zip", "*.tar.gz", "*.tgz"].map((pattern) =>
+        Array.fromAsync(new Bun.Glob(pattern).scan({ cwd: path.join(dir, "dist") })),
+      ),
+    )
+  )
+    .flat()
+    .sort()
+    .map((file) => path.join(dir, "dist", file))
+
+const createNpmInstallerPackage = async (binaries: Record<string, string>) => {
+  const installerDir = path.join(dir, "dist", `${pkg.name}-ai`)
+  await $`rm -rf ${installerDir}`
+  await $`mkdir -p ${path.join(installerDir, "bin")}`
+  await $`cp -r ${path.join(dir, "bin")} ${installerDir}`
+  await $`cp ${path.join(dir, "script/postinstall.mjs")} ${path.join(installerDir, "postinstall.mjs")}`
+  await Bun.file(path.join(installerDir, "LICENSE")).write(await Bun.file(path.join(dir, "../../LICENSE")).text())
+  await Bun.file(path.join(installerDir, "package.json")).write(
+    JSON.stringify(
+      {
+        name: `${pkg.name}-ai`,
+        version: Script.version,
+        license: pkg.license,
+        bin: {
+          [pkg.name]: `./bin/${pkg.name}`,
+        },
+        scripts: {
+          postinstall: "bun ./postinstall.mjs || node ./postinstall.mjs",
+        },
+        optionalDependencies: Object.fromEntries(
+          Object.entries(binaries).map(([name, version]) => [name, releaseAssetUrl(name, version)]),
+        ),
+      },
+      null,
+      2,
+    ),
+  )
+  await packNpmPackage(installerDir)
+}
+
 const allTargets: {
   os: string
   arch: "arm64" | "x64" | "loong64"
@@ -424,8 +478,10 @@ if (Script.release) {
     } else {
       await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
     }
+    await packNpmPackage(path.join(dir, "dist", key))
   }
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${process.env.GH_REPO}`
+  await createNpmInstallerPackage(binaries)
+  await $`gh release upload v${Script.version} ${await releaseAssets()} --clobber --repo ${releaseAssetRepo()}`
 }
 
 export { binaries }
