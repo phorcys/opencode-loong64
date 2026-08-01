@@ -52,7 +52,32 @@ const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
   const appDir = path.join(import.meta.dirname, "../../app")
   const dist = path.join(appDir, "dist")
-  await $`OPENCODE_CHANNEL=${Script.channel} bun run --cwd ${appDir} build`
+  const buildLog = path.join(dir, "dist", "opencode-web-ui-build.log")
+  // On loong64 the esbuild service process spawned by vite never exits, keeping the
+  // vite process alive after the build is done. Run the build in the background,
+  // wait for the completion marker, then terminate the service so the script can continue.
+  await $`mkdir -p ${path.dirname(buildLog)}`
+  await $`rm -f ${buildLog}`
+  const buildProc = Bun.spawn({
+    cmd: ["bash", "-c", `OPENCODE_CHANNEL=${Script.channel} bun run --cwd ${appDir} build > ${buildLog} 2>&1`],
+  })
+  const readBuildLog = async () => {
+    if (!(await Bun.file(buildLog).exists())) return ""
+    return Bun.file(buildLog).text()
+  }
+  let waited = 0
+  while (buildProc.exitCode === null && !(await readBuildLog()).includes("built in") && waited < 900) {
+    await Bun.sleep(2000)
+    waited += 1
+  }
+  // The vite process itself stays alive after finishing (leaked WASI workers keep
+  // its event loop alive), so terminate both it and any lingering esbuild service.
+  await $`pkill -f 'esbuild --ser''vice'`.nothrow()
+  await $`pkill -9 -f 'node_modules/.bin/vite bui''ld'`.nothrow()
+  const exitCode = await buildProc.exited
+  if (exitCode !== 0 && !(await readBuildLog()).includes("built in")) {
+    throw new Error(`Building the web UI failed with exit code ${exitCode}; see ${buildLog}`)
+  }
   const files = (await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: dist })))
     .map((file) => file.replaceAll("\\", "/"))
     .filter((file) => !file.endsWith(".map"))
