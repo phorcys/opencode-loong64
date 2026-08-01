@@ -7,6 +7,11 @@
 # links them into the cache-link scopes so node resolution works.
 #
 # Run from the repo root:  bash script/loong64-setup.sh
+#
+# IMPORTANT: build the opencode binary with the source-built bun 1.4.x from
+# ~/work/src/bun/build/release-la64v10/bun. The 1.3.14-canary bun that ships in
+# ~/.bun/bin crashes the TUI on loong64 (JSC worker-thread segfault in opentui
+# 0.4.5); 1.4.0 (loong64: update WebKit prebuilt) fixes it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
