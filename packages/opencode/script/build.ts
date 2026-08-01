@@ -619,9 +619,6 @@ for (const item of targets) {
       execArgv: [
         `--user-agent=opencode/${Script.version}`,
         "--use-system-ca",
-        // JavaScriptCore's DFG/FTL JIT is unstable on loong64; disable it for
-        // the standalone binary (see loong64 runtime fixes).
-        ...(item.arch === "loong64" ? ["--jsc:useDFGJIT=false", "--jsc:useFTLJIT=false"] : []),
         "--",
       ],
       windows: {},
