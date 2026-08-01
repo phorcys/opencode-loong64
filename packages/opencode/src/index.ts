@@ -30,6 +30,11 @@ import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
+// OpenTUI core contains top-level async native initialization. Load it before
+// the CLI command graph so split chunks that extend OpenTUI classes do not
+// evaluate while the core module is still suspended.
+await import("@opentui/core")
+
 const args = hideBin(process.argv)
 
 function show(out: string) {

@@ -205,13 +205,30 @@ const resolveOpenTUILoong64Library = async () => {
 const createOpenTUILoong64NativePlugin = (sidecar: string): BunPlugin => ({
   name: "opencode-opentui-loong64-native-sidecar",
   setup(build) {
-    build.onLoad({ filter: /@opentui\/core\/index-[^/]+\.js$/ }, async (args) => {
+    build.onLoad({ filter: /@opentui\/core\/(?:index-[^/]+|chunk-bun-[^/]+)\.js$/ }, async (args) => {
       const contents = await Bun.file(args.path).text()
       const replacement = [
         "var targetLibPath = __opencodeOpenTUIJoin(",
         "  __opencodeOpenTUIDirname(process.execPath),",
         `  ${JSON.stringify(sidecar)},`,
         ");",
+      ].join("\n")
+      // @opentui/core 0.4.5 loads the native library via resolveNativeLibraryPath()
+      // in the bundled chunk; add a loong64 early return before the asset target
+      // check, which rejects anything that is not arm64/x64.
+      const nodeAssetsLoaderNeedle = [
+        "async function resolveNativeLibraryPath() {",
+        "  const asset = getNativeAssetDescriptor(getCurrentNodeAssetTarget());",
+      ].join("\n")
+      const nodeAssetsReplacement = [
+        "async function resolveNativeLibraryPath() {",
+        '  if (process.platform === "linux" && process.arch === "loong64") {',
+        "    return __opencodeOpenTUIJoin(",
+        "      __opencodeOpenTUIDirname(process.execPath),",
+        `      ${JSON.stringify(sidecar)},`,
+        "    );",
+        "  }",
+        "  const asset = getNativeAssetDescriptor(getCurrentNodeAssetTarget());",
       ].join("\n")
       const currentLoaderNeedle = [
         "var nativePackage = await resolveNativePackage();",
@@ -230,14 +247,16 @@ const createOpenTUILoong64NativePlugin = (sidecar: string): BunPlugin => ({
         '  targetLibPath = targetLibPath.replace("../", "");',
         "}",
       ].join("\n")
-      const needle = contents.includes(currentLoaderNeedle)
-        ? currentLoaderNeedle
-        : contents.includes(legacyLoaderNeedle)
-          ? legacyLoaderNeedle
-          : undefined
+      const needle = contents.includes(nodeAssetsLoaderNeedle)
+        ? nodeAssetsLoaderNeedle
+        : contents.includes(currentLoaderNeedle)
+          ? currentLoaderNeedle
+          : contents.includes(legacyLoaderNeedle)
+            ? legacyLoaderNeedle
+            : undefined
       if (!needle) return
       const patchedContents = contents
-        .replace(needle, replacement)
+        .replace(needle, contents.includes(nodeAssetsLoaderNeedle) ? nodeAssetsReplacement : replacement)
         .replace(
           'var pointerSize = process.arch === "x64" || process.arch === "arm64" ? 8 : 4;',
           'var pointerSize = process.arch === "x64" || process.arch === "arm64" || process.arch === "loong64" ? 8 : 4;',
@@ -600,6 +619,9 @@ for (const item of targets) {
       execArgv: [
         `--user-agent=opencode/${Script.version}`,
         "--use-system-ca",
+        // JavaScriptCore's DFG/FTL JIT is unstable on loong64; disable it for
+        // the standalone binary (see loong64 runtime fixes).
+        ...(item.arch === "loong64" ? ["--jsc:useDFGJIT=false", "--jsc:useFTLJIT=false"] : []),
         "--",
       ],
       windows: {},
