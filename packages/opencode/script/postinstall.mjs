@@ -26,7 +26,7 @@ const platform = platformMap[os.platform()] ?? os.platform()
 const arch = archMap[os.arch()] ?? os.arch()
 const base = `opencode-${platform}-${arch}`
 const sourceBinary = platform === "windows" ? "opencode.exe" : "opencode"
-const targetBinary = path.join(__dirname, "bin", "opencode.exe")
+const targetBinary = path.join(__dirname, "bin", ".opencode")
 
 function supportsAvx2() {
   if (arch !== "x64") return false
@@ -116,11 +116,12 @@ function packageNames() {
   return [base]
 }
 
-function resolveBinary(name) {
+function resolvePackageBinDir(name) {
   const packageJsonPath = require.resolve(`${name}/package.json`)
-  const binaryPath = path.join(path.dirname(packageJsonPath), "bin", sourceBinary)
+  const packageBinDir = path.join(path.dirname(packageJsonPath), "bin")
+  const binaryPath = path.join(packageBinDir, sourceBinary)
   if (!fs.existsSync(binaryPath)) throw new Error(`Binary not found at ${binaryPath}`)
-  return binaryPath
+  return packageBinDir
 }
 
 function installPackage(name) {
@@ -135,15 +136,14 @@ function installPackage(name) {
       { stdio: "inherit", windowsHide: true },
     )
     if (result.status !== 0) return
-    const packageDir = path.join(temp, "node_modules", name)
-    copyBinary(path.join(packageDir, "bin", sourceBinary), targetBinary)
+    installPackageBinDir(path.join(temp, "node_modules", name, "bin"))
     return true
   } finally {
     fs.rmSync(temp, { recursive: true, force: true })
   }
 }
 
-function copyBinary(source, target) {
+function linkOrCopy(source, target) {
   if (!fs.existsSync(source)) throw new Error(`Binary not found at ${source}`)
   fs.mkdirSync(path.dirname(target), { recursive: true })
   if (fs.existsSync(target)) fs.unlinkSync(target)
@@ -152,7 +152,19 @@ function copyBinary(source, target) {
   } catch {
     fs.copyFileSync(source, target)
   }
-  fs.chmodSync(target, 0o755)
+}
+
+function installPackageBinDir(packageBinDir) {
+  linkOrCopy(path.join(packageBinDir, sourceBinary), targetBinary)
+
+  for (const name of fs.readdirSync(packageBinDir)) {
+    if (name === sourceBinary) continue
+    const source = path.join(packageBinDir, name)
+    if (!fs.statSync(source).isFile()) continue
+    linkOrCopy(source, path.join(__dirname, "bin", name))
+  }
+
+  fs.chmodSync(targetBinary, 0o755)
 }
 
 function verifyBinary() {
@@ -167,7 +179,7 @@ function verifyBinary() {
 function main() {
   for (const name of packageNames()) {
     try {
-      copyBinary(resolveBinary(name), targetBinary)
+      installPackageBinDir(resolvePackageBinDir(name))
       if (verifyBinary()) return
     } catch {
       if (installPackage(name) && verifyBinary()) return

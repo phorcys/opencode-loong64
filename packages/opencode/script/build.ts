@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 
-import { $ } from "bun"
+import { $, type BunPlugin } from "bun"
+import fs from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
+import { createRequire } from "module"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 
 const __filename = fileURLToPath(import.meta.url)
@@ -20,14 +22,62 @@ const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
-const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+const requireFromOpencode = createRequire(path.join(dir, "package.json"))
+
+const ensureOpenTUIBabelPresetForBunIsolatedInstall = () => {
+  let solidEntry: string
+  let corePackageJson: string
+  let presetPackageJson: string
+  try {
+    solidEntry = requireFromOpencode.resolve("@opentui/solid")
+    corePackageJson = requireFromOpencode.resolve("@babel/core/package.json", { paths: [solidEntry] })
+    presetPackageJson = requireFromOpencode.resolve("@babel/preset-typescript/package.json", { paths: [solidEntry] })
+  } catch {
+    return
+  }
+
+  const coreRoot = path.dirname(fs.realpathSync(corePackageJson))
+  const presetRoot = path.dirname(fs.realpathSync(presetPackageJson))
+  const link = path.join(path.dirname(coreRoot), "preset-typescript")
+  if (fs.existsSync(link)) return
+
+  fs.symlinkSync(presetRoot, link, "dir")
+}
+
+ensureOpenTUIBabelPresetForBunIsolatedInstall()
+const plugin = createSolidTransformPlugin()
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
   const appDir = path.join(import.meta.dirname, "../../app")
   const dist = path.join(appDir, "dist")
-  await $`OPENCODE_CHANNEL=${Script.channel} bun run --cwd ${appDir} build`
+  const buildLog = path.join(dir, "dist", "opencode-web-ui-build.log")
+  // On loong64 the esbuild service process spawned by vite never exits, keeping the
+  // vite process alive after the build is done. Run the build in the background,
+  // wait for the completion marker, then terminate the service so the script can continue.
+  await $`mkdir -p ${path.dirname(buildLog)}`
+  await $`rm -f ${buildLog}`
+  const buildProc = Bun.spawn({
+    cmd: ["bash", "-c", `OPENCODE_CHANNEL=${Script.channel} bun run --cwd ${appDir} build > ${buildLog} 2>&1`],
+  })
+  const readBuildLog = async () => {
+    if (!(await Bun.file(buildLog).exists())) return ""
+    return Bun.file(buildLog).text()
+  }
+  let waited = 0
+  while (buildProc.exitCode === null && !(await readBuildLog()).includes("built in") && waited < 900) {
+    await Bun.sleep(2000)
+    waited += 1
+  }
+  // The vite process itself stays alive after finishing (leaked WASI workers keep
+  // its event loop alive), so terminate both it and any lingering esbuild service.
+  await $`pkill -f 'esbuild --ser''vice'`.nothrow()
+  await $`pkill -9 -f 'node_modules/.bin/vite bui''ld'`.nothrow()
+  const exitCode = await buildProc.exited
+  if (exitCode !== 0 && !(await readBuildLog()).includes("built in")) {
+    throw new Error(`Building the web UI failed with exit code ${exitCode}; see ${buildLog}`)
+  }
   const files = (await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: dist })))
     .map((file) => file.replaceAll("\\", "/"))
     .filter((file) => !file.endsWith(".map"))
@@ -50,15 +100,389 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
+const opentuiLoong64Sidecar = "libopentui.so"
+const parcelWatcherLoong64Sidecar = "parcel-watcher.node"
+const fffLoong64Sidecar = "libfff_c.so"
+
+type RootPackageJson = {
+  workspaces?: {
+    catalog?: Record<string, string>
+  }
+}
+
+const rootPackageJson: RootPackageJson = JSON.parse(fs.readFileSync(path.resolve(dir, "../..", "package.json"), "utf8"))
+
+const expectedOpenTUIVersion = () => {
+  const version = pkg.dependencies["@opentui/core"]
+  return version === "catalog:" ? rootPackageJson.workspaces?.catalog?.["@opentui/core"] : version
+}
+
+const opentuiLoong64LibraryCandidates = () => {
+  const nativePackagePath = "node_modules/@opentui/core-linux-loong64"
+  const bunNativePackagePath = "node_modules/.bun/node_modules/@opentui/core-linux-loong64"
+  return [
+    { lib: process.env.OPENTUI_LOONG64_LIB },
+    {
+      lib: path.resolve(dir, "../../../opentui/packages/core", nativePackagePath, opentuiLoong64Sidecar),
+      packageJson: path.resolve(dir, "../../../opentui/packages/core", nativePackagePath, "package.json"),
+    },
+    {
+      lib: path.resolve(dir, bunNativePackagePath, opentuiLoong64Sidecar),
+      packageJson: path.resolve(dir, bunNativePackagePath, "package.json"),
+    },
+    {
+      lib: path.resolve(dir, nativePackagePath, opentuiLoong64Sidecar),
+      packageJson: path.resolve(dir, nativePackagePath, "package.json"),
+    },
+    {
+      lib: path.resolve(dir, "../../", bunNativePackagePath, opentuiLoong64Sidecar),
+      packageJson: path.resolve(dir, "../../", bunNativePackagePath, "package.json"),
+    },
+    {
+      lib: path.resolve(dir, "../../", nativePackagePath, opentuiLoong64Sidecar),
+      packageJson: path.resolve(dir, "../../", nativePackagePath, "package.json"),
+    },
+  ].filter((candidate): candidate is { lib: string; packageJson?: string } => Boolean(candidate.lib))
+}
+
+const findOpenTUILoong64Library = () => {
+  const expected = expectedOpenTUIVersion()
+  for (const candidate of opentuiLoong64LibraryCandidates()) {
+    if (!fs.existsSync(candidate.lib)) continue
+    if (candidate.packageJson && fs.existsSync(candidate.packageJson)) {
+      const nativePackageJson = JSON.parse(fs.readFileSync(candidate.packageJson, "utf8"))
+      if (expected && nativePackageJson.version !== expected) {
+        console.warn(
+          `Using ${candidate.lib}: @opentui/core-linux-loong64 is ${nativePackageJson.version}, expected ${expected}`,
+        )
+      }
+    }
+    return fs.realpathSync(candidate.lib)
+  }
+}
+
+const openTUISourceCandidates = () =>
+  [
+    process.env.OPENTUI_SOURCE_DIR,
+    path.resolve(dir, "../../../opentui"),
+    path.resolve(dir, "../../opentui"),
+    path.resolve(process.cwd(), "opentui"),
+  ]
+    .filter(Boolean)
+    .filter((candidate): candidate is string => fs.existsSync(path.join(candidate, "packages/core/package.json")))
+
+const buildOpenTUILoong64Library = async () => {
+  for (const sourceRoot of openTUISourceCandidates()) {
+    const corePackageJson = JSON.parse(fs.readFileSync(path.join(sourceRoot, "packages/core/package.json"), "utf8"))
+    const expected = expectedOpenTUIVersion()
+    if (expected && corePackageJson.version !== expected) {
+      console.warn(
+        `Building OpenTUI source at ${sourceRoot}: @opentui/core is ${corePackageJson.version}, expected ${expected}`,
+      )
+    }
+
+    console.log(`Building @opentui/core-linux-loong64 from ${sourceRoot}`)
+    await $`bun run --cwd ${path.join(sourceRoot, "packages/core")} build:native`
+
+    const lib = findOpenTUILoong64Library()
+    if (lib) return lib
+  }
+}
+
+const resolveOpenTUILoong64Library = async () => {
+  const lib = findOpenTUILoong64Library() ?? (await buildOpenTUILoong64Library())
+  if (!lib) {
+    throw new Error(
+      [
+        "Unable to find @opentui/core-linux-loong64/libopentui.so.",
+        "Set OPENTUI_LOONG64_LIB or OPENTUI_SOURCE_DIR, or place a loong64-enabled OpenTUI checkout next to opencode.",
+      ].join(" "),
+    )
+  }
+  return lib
+}
+
+const createOpenTUILoong64NativePlugin = (sidecar: string): BunPlugin => ({
+  name: "opencode-opentui-loong64-native-sidecar",
+  setup(build) {
+    build.onLoad({ filter: /@opentui\/core\/(?:index-[^/]+|chunk-bun-[^/]+)\.js$/ }, async (args) => {
+      const contents = await Bun.file(args.path).text()
+      const replacement = [
+        "var targetLibPath = __opencodeOpenTUIJoin(",
+        "  __opencodeOpenTUIDirname(process.execPath),",
+        `  ${JSON.stringify(sidecar)},`,
+        ");",
+      ].join("\n")
+      // @opentui/core 0.4.5 loads the native library via resolveNativeLibraryPath()
+      // in the bundled chunk; add a loong64 early return before the asset target
+      // check, which rejects anything that is not arm64/x64.
+      const nodeAssetsLoaderNeedle = [
+        "async function resolveNativeLibraryPath() {",
+        "  const asset = getNativeAssetDescriptor(getCurrentNodeAssetTarget());",
+      ].join("\n")
+      const nodeAssetsReplacement = [
+        "async function resolveNativeLibraryPath() {",
+        '  if (process.platform === "linux" && process.arch === "loong64") {',
+        "    return __opencodeOpenTUIJoin(",
+        "      __opencodeOpenTUIDirname(process.execPath),",
+        `      ${JSON.stringify(sidecar)},`,
+        "    );",
+        "  }",
+        "  const asset = getNativeAssetDescriptor(getCurrentNodeAssetTarget());",
+      ].join("\n")
+      const currentLoaderNeedle = [
+        "var nativePackage = await resolveNativePackage();",
+        "var targetLibPath = nativePackage.default;",
+        "if (isBunfsPath(targetLibPath)) {",
+        '  targetLibPath = targetLibPath.replace("../", "");',
+        "}",
+        "if (!existsSync2(targetLibPath)) {",
+        "  throw new Error(`opentui is not supported on the current platform: ${process.platform}-${process.arch}`);",
+        "}",
+      ].join("\n")
+      const legacyLoaderNeedle = [
+        "var module = await import(`@opentui/core-${process.platform}-${process.arch}/index.ts`);",
+        "var targetLibPath = module.default;",
+        "if (isBunfsPath(targetLibPath)) {",
+        '  targetLibPath = targetLibPath.replace("../", "");',
+        "}",
+      ].join("\n")
+      const needle = contents.includes(nodeAssetsLoaderNeedle)
+        ? nodeAssetsLoaderNeedle
+        : contents.includes(currentLoaderNeedle)
+          ? currentLoaderNeedle
+          : contents.includes(legacyLoaderNeedle)
+            ? legacyLoaderNeedle
+            : undefined
+      if (!needle) return
+      const patchedContents = contents
+        .replace(needle, contents.includes(nodeAssetsLoaderNeedle) ? nodeAssetsReplacement : replacement)
+        .replace(
+          'var pointerSize = process.arch === "x64" || process.arch === "arm64" ? 8 : 4;',
+          'var pointerSize = process.arch === "x64" || process.arch === "arm64" || process.arch === "loong64" ? 8 : 4;',
+        )
+        .replace(
+          /return (bun\d*)\.toArrayBuffer\((toBunPointer\d*)\(pointer\), offset, (length\d*)\);/g,
+          [
+            "const buffer = $1.toArrayBuffer($2(pointer), offset, $3);",
+            "      if (buffer instanceof Error) {",
+            "        throw buffer;",
+            "      }",
+            "      return buffer;",
+          ].join("\n"),
+        )
+
+      return {
+        loader: "js",
+        contents:
+          'import { dirname as __opencodeOpenTUIDirname, join as __opencodeOpenTUIJoin } from "path"\n' +
+          patchedContents,
+      }
+    })
+    build.onResolve({ filter: /^@opentui\/core-linux-loong64(?:\/.*)?$/ }, () => ({
+      path: "@opentui/core-linux-loong64",
+      namespace: "opencode-opentui-native-sidecar",
+    }))
+    build.onLoad({ filter: /.*/, namespace: "opencode-opentui-native-sidecar" }, () => ({
+      loader: "js",
+      contents: [
+        'import path from "path"',
+        `export default path.join(path.dirname(process.execPath), ${JSON.stringify(sidecar)})`,
+      ].join("\n"),
+    }))
+  },
+})
+
+const parcelWatcherLoong64BindingCandidates = () => {
+  const nativePackagePath = "node_modules/@parcel/watcher-linux-loong64-glibc/watcher.node"
+  const bunNativePackagePath = "node_modules/.bun/node_modules/@parcel/watcher-linux-loong64-glibc/watcher.node"
+  return [
+    process.env.PARCEL_WATCHER_LOONG64_NODE,
+    path.resolve(dir, bunNativePackagePath),
+    path.resolve(dir, nativePackagePath),
+    path.resolve(dir, "../../", bunNativePackagePath),
+    path.resolve(dir, "../../", nativePackagePath),
+    path.resolve(dir, "node_modules/@parcel/watcher/build/Release/watcher.node"),
+    path.resolve(dir, "../../node_modules/@parcel/watcher/build/Release/watcher.node"),
+  ]
+    .filter(Boolean)
+    .filter((candidate): candidate is string => fs.existsSync(candidate))
+}
+
+const parcelWatcherSourceCandidates = () =>
+  [
+    path.resolve(dir, "node_modules/@parcel/watcher"),
+    path.resolve(dir, "../../node_modules/@parcel/watcher"),
+  ].filter((candidate) => fs.existsSync(path.join(candidate, "binding.gyp")))
+
+const findParcelWatcherLoong64Binding = () => {
+  for (const candidate of parcelWatcherLoong64BindingCandidates()) {
+    return fs.realpathSync(candidate)
+  }
+}
+
+const buildParcelWatcherLoong64Binding = async () => {
+  for (const sourceRoot of parcelWatcherSourceCandidates()) {
+    console.log(`Building @parcel/watcher linux-loong64-glibc binding from ${sourceRoot}`)
+    await $`bun run build`.cwd(sourceRoot)
+
+    const binding = findParcelWatcherLoong64Binding()
+    if (binding) return binding
+  }
+}
+
+const resolveParcelWatcherLoong64Binding = async () => {
+  const binding = findParcelWatcherLoong64Binding() ?? (await buildParcelWatcherLoong64Binding())
+  if (!binding) {
+    throw new Error(
+      [
+        "Unable to find @parcel/watcher linux-loong64-glibc watcher.node.",
+        "Set PARCEL_WATCHER_LOONG64_NODE or install/build @parcel/watcher on loong64 before packaging.",
+      ].join(" "),
+    )
+  }
+  return binding
+}
+
+const fffLoong64LibraryCandidates = () =>
+  [
+    process.env.FFF_LOONG64_LIB,
+    path.resolve(dir, "../../../fff/target/release", fffLoong64Sidecar),
+    path.resolve(dir, "../../fff/target/release", fffLoong64Sidecar),
+    path.resolve(process.cwd(), "fff/target/release", fffLoong64Sidecar),
+  ]
+    .filter(Boolean)
+    .filter((candidate): candidate is string => fs.existsSync(candidate))
+
+const fffSourceCandidates = () =>
+  [process.env.FFF_SOURCE_DIR, path.resolve(dir, "../../../fff"), path.resolve(dir, "../../fff")]
+    .filter(Boolean)
+    .filter((candidate): candidate is string => fs.existsSync(path.join(candidate, "crates/fff-c/Cargo.toml")))
+
+const findFFFLoong64Library = () => {
+  for (const candidate of fffLoong64LibraryCandidates()) {
+    return fs.realpathSync(candidate)
+  }
+}
+
+const buildFFFLoong64Library = async () => {
+  for (const sourceRoot of fffSourceCandidates()) {
+    console.log(`Building @ff-labs/fff-bun linux-loong64-gnu library from ${sourceRoot}`)
+    await $`cargo build -p fff-c --release`.cwd(sourceRoot)
+
+    const lib = findFFFLoong64Library()
+    if (lib) return lib
+  }
+}
+
+const resolveFFFLoong64Library = async () => {
+  const lib = findFFFLoong64Library() ?? (await buildFFFLoong64Library())
+  if (!lib) {
+    throw new Error(
+      [
+        "Unable to find @ff-labs/fff-bun linux-loong64-gnu libfff_c.so.",
+        "Set FFF_LOONG64_LIB or FFF_SOURCE_DIR, or place a built fff checkout next to opencode.",
+      ].join(" "),
+    )
+  }
+  return lib
+}
+
+const createFFFLoong64NativePlugin = (sidecar: string): BunPlugin => ({
+  name: "opencode-fff-loong64-native-sidecar",
+  setup(build) {
+    build.onLoad({ filter: /@ff-labs\/fff-bun\/src\/embedded\.ts$/ }, () => ({
+      loader: "ts",
+      contents: [
+        'import path from "path"',
+        `export const embeddedLibPath: string | null = path.join(path.dirname(process.execPath), ${JSON.stringify(sidecar)})`,
+      ].join("\n"),
+    }))
+    build.onLoad({ filter: /@ff-labs\/fff-bun\/src\/ffi\.ts$/ }, async (args) => {
+      const contents = await Bun.file(args.path).text()
+      const needle = [
+        '  const isEmbedded = embeddedLibPath?.includes("$bunfs") ?? false;',
+        "  const binaryPath = isEmbedded",
+        "    ? embeddedLibPath",
+        "    : (findBinary() ?? embeddedLibPath);",
+      ].join("\n")
+      if (!contents.includes(needle)) return
+
+      return {
+        loader: "ts",
+        contents: contents.replace(needle, "  const binaryPath = embeddedLibPath ?? findBinary();"),
+      }
+    })
+  },
+})
+
+const releaseAssetRepo = () => process.env.GH_REPO ?? "anomalyco/opencode"
+
+const npmTarballName = (name: string, version: string) => `${name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`
+
+const releaseAssetUrl = (name: string, version: string) =>
+  `https://github.com/${releaseAssetRepo()}/releases/download/v${version}/${npmTarballName(name, version)}`
+
+const packNpmPackage = async (packageDir: string) => {
+  if (process.platform !== "win32") await $`chmod -R 755 .`.cwd(packageDir)
+  await $`npm pack --pack-destination ${path.join(dir, "dist")} .`.cwd(packageDir)
+}
+
+const releaseAssets = async () =>
+  (
+    await Promise.all(
+      ["*.zip", "*.tar.gz", "*.tgz"].map((pattern) =>
+        Array.fromAsync(new Bun.Glob(pattern).scan({ cwd: path.join(dir, "dist") })),
+      ),
+    )
+  )
+    .flat()
+    .sort()
+    .map((file) => path.join(dir, "dist", file))
+
+const createNpmInstallerPackage = async (binaries: Record<string, string>) => {
+  const installerDir = path.join(dir, "dist", `${pkg.name}-ai`)
+  await $`rm -rf ${installerDir}`
+  await $`mkdir -p ${path.join(installerDir, "bin")}`
+  await $`cp -r ${path.join(dir, "bin")} ${installerDir}`
+  await $`cp ${path.join(dir, "script/postinstall.mjs")} ${path.join(installerDir, "postinstall.mjs")}`
+  await Bun.file(path.join(installerDir, "LICENSE")).write(await Bun.file(path.join(dir, "../../LICENSE")).text())
+  await Bun.file(path.join(installerDir, "package.json")).write(
+    JSON.stringify(
+      {
+        name: `${pkg.name}-ai`,
+        version: Script.version,
+        license: pkg.license,
+        bin: {
+          [pkg.name]: `./bin/${pkg.name}`,
+        },
+        scripts: {
+          postinstall: "bun ./postinstall.mjs || node ./postinstall.mjs",
+        },
+        optionalDependencies: Object.fromEntries(
+          Object.entries(binaries).map(([name, version]) => [name, releaseAssetUrl(name, version)]),
+        ),
+      },
+      null,
+      2,
+    ),
+  )
+  await packNpmPackage(installerDir)
+}
+
 const allTargets: {
   os: string
-  arch: "arm64" | "x64"
+  arch: "arm64" | "x64" | "loong64"
   abi?: "musl"
   avx2?: false
 }[] = [
   {
     os: "linux",
     arch: "arm64",
+  },
+  {
+    os: "linux",
+    arch: "loong64",
   },
   {
     os: "linux",
@@ -158,17 +582,33 @@ for (const item of targets) {
 
   const workerPath = "./src/cli/tui/worker.ts"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
+  const opentuiLoong64Library =
+    item.os === "linux" && item.arch === "loong64" ? await resolveOpenTUILoong64Library() : undefined
+  const parcelWatcherLoong64Binding =
+    item.os === "linux" && item.arch === "loong64" && (item.abi ?? "glibc") === "glibc"
+      ? await resolveParcelWatcherLoong64Binding()
+      : undefined
+  const fffLoong64Library =
+    item.os === "linux" && item.arch === "loong64" && (item.abi ?? "glibc") === "glibc"
+      ? await resolveFFFLoong64Library()
+      : undefined
+
+  // Use platform-specific bunfs root path based on target OS
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
   await Bun.build({
     conditions: ["bun", "node"],
     tsconfig: "./tsconfig.json",
-    plugins: [plugin],
+    plugins: [
+      plugin,
+      ...(opentuiLoong64Library ? [createOpenTUILoong64NativePlugin(opentuiLoong64Sidecar)] : []),
+      ...(fffLoong64Library ? [createFFFLoong64NativePlugin(fffLoong64Sidecar)] : []),
+    ],
     external: ["node-gyp"],
     format: "esm",
-    minify: true,
+    minify: item.arch !== "loong64",
     sourcemap: sourcemapsFlag ? "linked" : "none",
-    splitting: true,
+    splitting: item.arch !== "loong64",
     compile: {
       autoloadBunfig: false,
       autoloadDotenv: false,
@@ -176,7 +616,11 @@ for (const item of targets) {
       autoloadPackageJson: true,
       target: name.replace(pkg.name, "bun") as any,
       outfile: `dist/${name}/bin/opencode`,
-      execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
+      execArgv: [
+        `--user-agent=opencode/${Script.version}`,
+        "--use-system-ca",
+        "--",
+      ],
       windows: {},
     },
     files: {
@@ -200,6 +644,21 @@ for (const item of targets) {
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },
   })
+
+  if (opentuiLoong64Library) {
+    await fs.promises.copyFile(opentuiLoong64Library, path.join(dir, "dist", name, "bin", opentuiLoong64Sidecar))
+  }
+
+  if (parcelWatcherLoong64Binding) {
+    await fs.promises.copyFile(
+      parcelWatcherLoong64Binding,
+      path.join(dir, "dist", name, "bin", parcelWatcherLoong64Sidecar),
+    )
+  }
+
+  if (fffLoong64Library) {
+    await fs.promises.copyFile(fffLoong64Library, path.join(dir, "dist", name, "bin", fffLoong64Sidecar))
+  }
 
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
@@ -239,8 +698,10 @@ if (Script.release) {
     } else {
       await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
     }
+    await packNpmPackage(path.join(dir, "dist", key))
   }
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${process.env.GH_REPO}`
+  await createNpmInstallerPackage(binaries)
+  await $`gh release upload v${Script.version} ${await releaseAssets()} --clobber --repo ${releaseAssetRepo()}`
 }
 
 export { binaries }
